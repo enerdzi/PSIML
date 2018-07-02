@@ -1,0 +1,881 @@
+# <markdowncell>
+
+# ## TensorFlow
+#
+#
+# #### What is it?
+# * System for working with computational graphs over Tensor objects (analogous to numpy ndarrays).
+# * Automatic differentiation (backpropogation) for Variable objects.
+#
+# #### Why?
+# * Naive implementation of basic layers is easy, but opitimized implementation is harder.
+# * GPU implementation is even harder.
+# * In academia, industry, and PSIML projects, you are far more likely to use a framework that to code ConvNets from scratch.
+#
+# #### How to learn it?
+# * This notebook will try to cover a wide range of stuff.
+# * References to additional resources will be given where needed.
+# * You're welcome to use many excellent tutorials on the web, including the [one from Google](https://www.tensorflow.org/get_started/get_started).
+#
+# First import TensorFlow module, as we will be using it throughout. This also verifies that TensorFlow installation is OK.
+
+# <codecell>
+
+import tensorflow as tf
+import numpy as np
+from matplotlib import pyplot as plt
+get_ipython().run_line_magic('matplotlib', 'inline')
+import math
+from utils.vis_utils import visualize_grid
+from utils.data_utils import load_CIFAR10
+
+# <markdowncell>
+
+# ### Dataset
+#
+# We will use CIFAR-10 dataset from https://www.cs.toronto.edu/~kriz/cifar.html. The dataset contains 50,000 training images and 10,000 test images. All images are 32 x 32 x 3. Each image is classified as one of 10 classes.
+#
+# We call a utility function to load CIFAR-10 data.
+# Then we divide the data into training, validation, and test set.
+# Finally we normalize data by subtracting mean image from each sample.
+# Note that the mean image is computed from training set only.
+
+# <codecell>
+
+def get_CIFAR10_data(num_training = 49000, num_validation = 1000, num_test = 10000):
+    # Load the raw CIFAR-10 data
+    cifar10_dir = 'cifar-10-batches-py'
+    X_train, y_train, X_test, y_test = load_CIFAR10(cifar10_dir)
+
+    # Subsample the data
+    mask = range(num_training, num_training + num_validation)
+    X_val = X_train[mask]
+    y_val = y_train[mask]
+    mask = range(num_training)
+    X_train = X_train[mask]
+    y_train = y_train[mask]
+    mask = range(num_test)
+    X_test = X_test[mask]
+    y_test = y_test[mask]
+
+    # Normalize the data: subtract the mean image
+    mean_image = np.mean(X_train, axis = 0)
+    X_train -= mean_image
+    X_val -= mean_image
+    X_test -= mean_image
+
+    return X_train, y_train, X_val, y_val, X_test, y_test, mean_image
+
+# <markdowncell>
+
+# Invoke the above function to get data.
+
+# <codecell>
+
+X_train, y_train, X_val, y_val, X_test, y_test, mean_image = get_CIFAR10_data()
+
+# <markdowncell>
+
+# Check that the data has expected shape.
+
+# <codecell>
+
+print('Train data shape: ', X_train.shape)
+print('Train labels shape: ', y_train.shape)
+print('Validation data shape: ', X_val.shape)
+print('Validation labels shape: ', y_val.shape)
+print('Test data shape: ', X_test.shape)
+print('Test labels shape: ', y_test.shape)
+
+# <markdowncell>
+
+# Let's look at some random data samples.
+
+# <codecell>
+
+def visualize_CIFAR10_sample(X, y, sample_count = 10, class_count = 10):
+    set_size = X.shape[0]
+
+    # Randomize dataset.
+    data = np.ndarray([set_size, 2], dtype = np.int32)
+    data[:, 0] = list(range(set_size))
+    data[:, 1] = y
+    data[:, :] = data[np.random.permutation(set_size)]
+
+    # Select samples.
+    selection = { i : [] for i in range(class_count) }
+    count = 0
+    for (ind, cls) in data:
+        if len(selection[cls]) < sample_count:
+            selection[cls] += [ind]
+            count += 1
+        if count == class_count * sample_count:
+            break
+
+    # Ensure that we found enough samples.
+    assert count == class_count * sample_count
+
+    # Flatten list.
+    selection_flat = [item for cls in range(class_count) for item in selection[cls]]
+
+    # Visualize samples.
+    plt.figure(figsize = (12, 12))
+    plt.imshow(visualize_grid((X[selection_flat, :, :, :] + np.reshape(mean_image, [1, 32, 32, 3]))))
+    plt.axis("off")
+    plt.show()
+
+# <codecell>
+
+visualize_CIFAR10_sample(X_train, y_train)
+
+# <markdowncell>
+
+# Now that we know what the classes represent, we can create an array of human-readable names.
+
+# <codecell>
+
+class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck']
+
+# <markdowncell>
+
+# ## Defining and examining a simple network
+#
+# We define a simple network consisting of basic layers:
+# * convolutional layer,
+# * max-pooling layer,
+# * fully connected layer, and
+# * ReLU activation function.
+#
+# TensorFlow supports many other layer types and activations. See https://www.tensorflow.org/api_guides/python/nn for official API documentation. 
+#
+# The following line clears any network that might already exist in memory. 
+
+# <codecell>
+
+tf.reset_default_graph()
+
+# <markdowncell>
+
+# ### Create TensorBoard log file
+#
+# We can use the TensorBoard to visualize our training data. TensorBoard parses log files (also called event files) generated by TensorFlow. We will be placing those files in a separate dir.
+
+# <codecell>
+
+log_dir = './logs/'
+
+# <markdowncell>
+
+# A new event file is created by instantiating a `tf.FileWriter` class.
+
+# <codecell>
+
+writer = tf.summary.FileWriter(log_dir)
+
+# <markdowncell>
+
+# ### Placeholders for data
+# First we define placeholders for input data (input image and its label) using `tf.placeholder`.
+# We will eventually bind these to actual numerical data values.
+#
+# We choose to represent input data as 4D tensors whose shape is N x H x W x C, where:
+# * N is the number of examples in a batch (batch size)
+# * H is the height of each image in pixels
+# * W is the height of each image in pixels
+# * C is the number of channels (usually 3: R, G, B)
+#
+# This is the right way to represent the data for spatial operations like convolution. For fully connected layers, however, all dimensions except batch size will be collapsed into one.
+#
+# In `tf.placeholder`, if a dimension has value `None`, it will be set automatically once actual data is provided.
+
+# <codecell>
+
+def setup_input():
+    X = tf.placeholder(tf.float32, [None, 32, 32, 3], name = 'X')
+    y = tf.placeholder(tf.int64, [None], name = 'y')
+    is_training = tf.placeholder(tf.bool, name = 'is_training')
+    return X, y, is_training
+
+# <codecell>
+
+X, y, is_training = setup_input()
+
+# <markdowncell>
+
+# ### Convolutional and pooling nodes
+# Next we start defining define the main "body" of the network.
+# We start by adding a single convolutional layer with bias and ReLU activation.
+#
+# Convolutional layer is created by calling `tf.layers.conv2d`.
+# Returned object is of type `tf.Tensor` and represents output activations of the layer.
+#
+# Bias is enabled by default, so it is not explicitly specified.
+#
+# `padding = 'SAME'` means that we allow padding of roughly half the kernel size (TensorFlow computes this value automatically), to avoid reduction in output size due to boundary effects. The other option is `padding = 'VALID'`, where padding is disabled.
+#
+# We use [tf.layers API](https://www.tensorflow.org/api_docs/python/tf/layers) to generate a whole layer by a single function call. It is also possible to create each parameter and operation node separately, and connect them together, but that quickly becomes cumbersome for bigger networks. See [this tutorial](https://www.tensorflow.org/tutorials/layers) for how to use `tf.layers`.
+
+# <codecell>
+
+conv1 = tf.layers.conv2d(inputs = X, filters = 32, kernel_size = [7, 7], strides = 2, padding = 'SAME', activation=tf.nn.relu, name = 'conv1')
+
+# <markdowncell>
+
+# Next we add a max-pooling node.
+
+# <codecell>
+
+pool1 = tf.layers.max_pooling2d(inputs = conv1, pool_size = [2, 2], strides = 2, padding = 'SAME', name = 'pool1')
+
+# <markdowncell>
+
+# ### View default graph in TensorBoard
+#
+# We can write graph data to event file we create above. A graph can be passed to `FileWriter` constructor as well, in which case it is written to file immediately after the file is created.
+
+# <codecell>
+
+writer.add_graph(tf.get_default_graph())
+
+# <markdowncell>
+
+# Now you should be able to run `tensorboard --logdir=./logs` from console (with your Python environment activated), and see the graph visualized in browser at `http://localhost:6006`.
+#
+# For more details please see official tutorial on [graph visualization](https://www.tensorflow.org/get_started/graph_viz).
+#
+# Note: graph visualization seems to work best in Google Chrome.
+
+# <markdowncell>
+
+# ### Examining parameters and activations
+# Parameter tensors are hidden inside the convolution layer we created, and we don't have a handle on them. To get one, we have to know their names. For that we can either consult TensorBoard visualization, or list all variables in the graph
+
+# <codecell>
+
+tf.global_variables()
+
+# <markdowncell>
+
+# and pick the one we need by name. The `conv1` prefix in both names refers to the `name` parameter specified when creating the layer, and NOT the Python variable `conv1`.
+#
+# Then we access the tensor itself using `get_tensor_by_name`. For example, we can get the shapes of kernel and bias as follows
+
+# <codecell>
+
+conv1_kernel = tf.get_default_graph().get_tensor_by_name('conv1/kernel:0')
+conv1_bias = tf.get_default_graph().get_tensor_by_name('conv1/bias:0')
+print(conv1_kernel.shape)
+print(conv1_bias.shape)
+
+# <markdowncell>
+
+# Shapes of activation tensors are computed automatically, and can also be accessed using `shape`. Note that these tensors may have unknown dimensions which become known only when acutal input is presented.
+
+# <codecell>
+
+print(conv1.shape)
+print(pool1.shape)
+
+# <markdowncell>
+
+# ### Fully connected layers
+# Next we append a fully connected layer with 1024 output neurons and ReLU activation.
+# In order to determine the shape of its parameter tensor, we need to know the number of input neurons, which depends on the shape of the `relu1` activation tensor.
+
+# <codecell>
+
+fc1_input_count = int(pool1.shape[1] * pool1.shape[2] * pool1.shape[3])
+fc1_output_count = 1024
+print([fc1_input_count, fc1_output_count])
+
+# <markdowncell>
+
+# In order to append a fully connected layer, we need to flatten the spatial dimensions of `relu1`.
+
+# <codecell>
+
+pool1_flat = tf.reshape(pool1, [-1, fc1_input_count])
+
+# <markdowncell>
+
+# Now we are ready to add a fully connected layer.
+
+# <codecell>
+
+fc1 = tf.layers.dense(inputs = pool1_flat, units = 1024, activation = tf.nn.relu, name = 'fc1')
+
+# <markdowncell>
+
+# Finally, we add another fully connected layer with bias to output scores for 10 output classes. This layer has no nonlinearity following it, but it will be followed by a softmax function to convert scores to probabilities.
+
+# <codecell>
+
+class_count = 10
+fc2 = tf.layers.dense(inputs = fc1, units = class_count, name = 'fc2')
+
+# <markdowncell>
+
+# ### Final classification
+# We append a softmax layer to convert the scores coming from `fc2` into probabilities, as well as a "top-k" layer to get the three most probable guesses.
+
+# <codecell>
+
+prob = tf.nn.softmax(fc2)
+(guess_prob, guess_class) = tf.nn.top_k(prob, k = 3)
+
+# <markdowncell>
+
+# ### Visualizing parameters and activations
+# TensorBoard supports visualizing tensors as images using `tf.summary.image` function.
+# We add a subnetwork that computes images from `conv1_kernel` and `conv1`.
+
+# <codecell>
+
+with tf.variable_scope('conv1_visualization'):
+    # Normalize to [0 1].
+    x_min = tf.reduce_min(conv1_kernel)
+    x_max = tf.reduce_max(conv1_kernel)
+    normalized = (conv1_kernel - x_min) / (x_max - x_min)
+
+    # Transpose to [batch_size, height, width, channels] layout.
+    transposed = tf.transpose(normalized, [3, 0, 1, 2])
+
+    # Display random 5 filters from the 32 in conv1.
+    conv1_kernel_image = tf.summary.image('conv1/kernel', transposed, max_outputs = 3)
+
+    # Do the same for output of conv1.
+    sliced = tf.slice(conv1, [0, 0, 0, 0], [1, -1, -1, -1])
+    x_min = tf.reduce_min(sliced)
+    x_max = tf.reduce_max(sliced)
+    normalized = (sliced - x_min) / (x_max - x_min)
+    transposed = tf.transpose(normalized, [3, 1, 2, 0])
+    conv1_image = tf.summary.image('conv1', transposed, max_outputs = 3)
+
+# <markdowncell>
+
+# ### Update graph visualization
+# We have added some new nodes, and we need to check if the new graph is OK.
+# To update TensorBoard visualization, we just add a new graph to the event file.
+# The visualizer will pick up the latest graph when its browser tab is refreshed.
+
+# <codecell>
+
+writer.add_graph(tf.get_default_graph())
+
+# <markdowncell>
+
+# ### Forward pass
+# Next we run one CIFAR-10 frame through the network.
+
+# <codecell>
+
+def choose_random_image():
+    index = np.random.randint(0, X_train.shape[0])
+    image = X_train[[index], :, :, :]
+    label = y_train[[index]]
+    return index, image, label
+
+# <codecell>
+
+random_index, random_image, random_label = choose_random_image()
+
+# <markdowncell>
+
+# A TensorFlow graph is executed by creating a `tf.Session` object and calling its `run` method.
+# A session object encapsulates the control and state of the TensorFlow runtime.
+# The `run` method requires a list of output tensors that should be computed, and a mapping of input tensors to actual data that should be used. For more information, see the TensorFlow [Getting started](https://www.tensorflow.org/get_started/get_started) guide.
+#
+# Optionally we can also specify a device context such as `/cpu:0` or `/gpu:0`. For documentation on this see [this TensorFlow guide](https://www.tensorflow.org/tutorials/using_gpu). The default device is a GPU if available, and a CPU otherwise, so we can skip the device specification from now on.
+#
+# Note: if GPU is explicitly specified, but not available, a Python exception is thrown; current graph is invalidated, and needs to be cleared and rebuilt.
+
+# <codecell>
+
+with tf.Session() as sess:
+    with tf.device("/cpu:0") as dev: #"/cpu:0" or "/gpu:0"
+        # Initialize weights.
+        sess.run(tf.global_variables_initializer())
+
+        # Map inputs to data.
+        feed_dict = { X : random_image, y : random_label }
+
+        # Set up variables we want to compute.
+        variables = [guess_prob, guess_class, conv1_kernel_image, conv1_image]
+
+        # Perform forward pass.
+        guess_prob_value, guess_class_value, conv1_kernel_value, conv1_value = sess.run(variables, feed_dict = feed_dict)
+
+# <markdowncell>
+
+# First let's see the image that was chosen, and networks predictions for it.
+
+# <codecell>
+
+def visualize_classification(image, guess_class, guess_prob):
+    plt.imshow(image)
+    plt.axis("off")
+    plt.show()
+    for i in range(3):
+        ind = guess_class[0, i]
+        prob = guess_prob[0, i]
+        print("Class: {0}\tProbability: {1:0.0f}%".format(class_names[ind], prob * 100))
+    print("Ground truth: {0}".format(class_names[random_label[0]]))
+
+# <codecell>
+
+visualize_classification(random_image[0, :, :, :] + mean_image, guess_class_value, guess_prob_value)
+
+# <markdowncell>
+
+# We write generated images to file. After running the next cell the images should be visible in TensorBoard.
+
+# <codecell>
+
+writer.add_summary(conv1_kernel_value)
+writer.add_summary(conv1_value)
+
+# <markdowncell>
+
+# ### Loss and metric(s)
+#
+# We append more nodes to compute loss value, and the number of correctly predicted pixels.
+# For loss we use `tf.softmax_cross_entropy_with_logits`. For other loss functions available out of the box in TensorFlow, see https://www.tensorflow.org/api_guides/python/nn#Losses. Of course, you can always build your own custom loss functions from simpler operations.
+
+# <codecell>
+
+# Setup metrics (e.g. loss and accuracy).
+def setup_metrics(y, y_out):
+    # Define loss function.
+    total_loss = tf.nn.softmax_cross_entropy_with_logits(labels = tf.one_hot(y, 10), logits = y_out)
+    mean_loss = tf.reduce_mean(total_loss)
+
+    # Add top three predictions.
+    prob = tf.nn.softmax(y_out)
+    (guess_prob, guess_class) = tf.nn.top_k(prob, k = 3)
+
+    # Compute number of correct predictions.
+    is_correct = tf.equal(tf.argmax(y_out, 1), y)
+    accuracy = tf.reduce_mean(tf.cast(is_correct, tf.float32))
+
+    return mean_loss, accuracy, guess_prob, guess_class
+
+# <markdowncell>
+
+# We will be reusing this function later for other architectures.
+# Now we create metrics for our current network.
+
+# <codecell>
+
+mean_loss, accuracy, guess_prob, guess_class = setup_metrics(y, fc2)
+
+# <markdowncell>
+
+# ### Visualizing loss and metric(s)
+# We would like to use TensorBoard to visualize loss value and correct count.
+# We add special nodes that generate those logs.
+#
+# We also add a special node that collects all summary nodes in the network. Evaluating this node in a call to `tf.Session.run` causes all summaries to be computed.
+
+# <codecell>
+
+def setup_scalar_summaries():
+    tf.summary.scalar('mean_loss', mean_loss)
+    tf.summary.scalar('accuracy', accuracy)
+    all_summaries = tf.summary.merge_all()
+    return all_summaries
+
+# <codecell>
+
+all_summaries = setup_scalar_summaries()
+
+# <markdowncell>
+
+# ### Optimizer
+#
+# Finally, we define the optimization algorithm to be used for training. We use the Adam optimizer with learning rate 5e-4. For other choices see https://www.tensorflow.org/api_guides/python/train#Optimizers.
+#
+# Optimizer's `minimize` method essentially generates a network that performs backward pass based on the forward pass network that we defined, and passed to the optimizer via argument to `minimize`.
+# The result of this method is a dummy node `train_step` which, when evaluated triggers execution of backward pass.
+
+# <codecell>
+
+def setup_optimizer(loss, learning_rate):
+    optimizer = tf.train.AdamOptimizer(learning_rate)
+    # Batch normalization in TensorFlow requires this extra dependency
+    extra_update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+    with tf.control_dependencies(extra_update_ops):
+        train_step = optimizer.minimize(loss)
+    return train_step
+
+# <markdowncell>
+
+# We will be reusing this function for other architectures. Now we create optimizer for our current network.
+
+# <codecell>
+
+train_step = setup_optimizer(mean_loss, 5e-4)
+
+# <markdowncell>
+
+# ### Adding an optional backward pass
+# Above we saw how to execute forward pass using `tf.Session.run`. Now we wrap that into a function (since we will be calling it in a loop to train the network). We also add an option to execute a backward pass by passing the extra argument `training`. That way we can use the same function for both training (forward + backward), and evaluation (forward only).
+
+# <codecell>
+
+def run_iteration(session, X_data, y_data, training = None):
+    # Set up variables we want to compute.
+    variables = [mean_loss, accuracy, guess_prob, guess_class, all_summaries]
+    if training != None:
+        variables += [training]
+
+    # Map inputs to data.
+    feed_dict = { X: X_data, y: y_data, is_training: training != None }
+
+    # Compute variable values, and perform training step if required.
+    values = session.run(variables, feed_dict = feed_dict)
+
+    # Return loss value and number of correct predictions.
+    return values[:-1] if training != None else values
+
+# <markdowncell>
+
+# ### Main training/evaluation loop
+# The following is a simple function which trains or evaluates current model for a given number of epochs by repeatedly calling the `run_iteration` function defined above. It also takes care of:
+# * aggregating loss and accuracy values over all minibatches
+# * plotting loss value over time.
+
+# <codecell>
+
+def run_model(session, predict, loss_val, Xd, yd,
+              epochs = 1, batch_size = 64, print_every = 100,
+              training = None):
+
+    dataset_size = Xd.shape[0]
+    batches_in_epoch = int(math.ceil(dataset_size / batch_size))
+
+    # Shuffle indices.
+    train_indices = np.arange(dataset_size)
+    np.random.shuffle(train_indices)
+
+    # Count iterations since the beginning of training.
+    iter_cnt = 0
+
+    for e in range(epochs):
+        # Keep track of performance stats (loss and accuracy) in current epoch.
+        total_correct = 0
+        losses = []
+
+        # Iterate over the dataset once.
+        for i in range(batches_in_epoch):
+
+            # Indices for current batch.
+            start_idx = (i * batch_size) % dataset_size
+            idx = train_indices[start_idx : (start_idx + batch_size)]
+
+            # Get batch size (may not be equal to batch_size near the end of dataset).
+            actual_batch_size = yd[idx].shape[0]
+
+            loss, acc, _, _, summ = run_iteration(session, Xd[idx,:], yd[idx], training)
+
+            # Update performance stats.
+            losses.append(loss * actual_batch_size)
+            total_correct += acc * actual_batch_size
+
+            # Add summaries to event file.
+            if (training is not None):
+                writer.add_summary(summ, e * batches_in_epoch + i)
+
+            # Print status.
+            if (training is not None) and (iter_cnt % print_every) == 0:
+                print("Iteration {0}: with minibatch training loss = {1:.3g} and accuracy of {2:.2f}%".format(iter_cnt, loss, acc * 100))
+            iter_cnt += 1
+
+        # Compute performance stats for current epoch.
+        total_accuracy = total_correct / dataset_size
+        total_loss = np.sum(losses) / dataset_size
+
+        print("Epoch {2}, Overall loss = {0:.3g} and accuracy of {1:.2f}%".format(total_loss, total_accuracy * 100, e + 1))
+    return total_loss, total_correct
+
+# <markdowncell>
+
+# ### Training the model for one epoch
+
+# <codecell>
+
+sess = tf.Session()
+sess.run(tf.global_variables_initializer())
+print('Training')
+run_model(sess, fc2, mean_loss, X_train, y_train, 1, 64, 100, train_step)
+print('Validation')
+_ = run_model(sess, fc2, mean_loss, X_val, y_val, 1, 64)
+
+# <markdowncell>
+
+# ### View summaries in TensorBoard log
+# Now you should be able to refresh your TensorBoard tab and see the summaries.
+# For more details please see [official tutorial](https://www.tensorflow.org/get_started/summaries_and_tensorboard) on summaries.
+# TensorFlow also supports other kinds of summaries, such as [histograms](https://www.tensorflow.org/get_started/tensorboard_histograms). 
+
+# <markdowncell>
+
+# ### Visualize some predictions
+# Accuracy should be somewhat better now.
+
+# <codecell>
+
+random_index, random_image, random_label = choose_random_image()
+_, _, guses_prob_value, guess_class_value, _ = run_iteration(sess, random_image, random_label)
+visualize_classification(random_image[0, :, :, :] + mean_image, guess_class_value, guess_prob_value)
+
+# <markdowncell>
+
+# ## Add batch normalization
+#
+# We modify the simple model by adding batch normalization after the convolution layer. We expect this network to train faster, and achieve better accuracy for the same number of weight updates.
+#
+# For convenience, we collect previous network definition code into a function `bn_model`. One difference from the above code is the line that defines the batch normalization layer. Parameters of `bn_model` are input placeholders, and its return value is the output tensor (plus any other tensors that are needed outside the function, i.e. for inspection or visualization). Another input parameter `is_training` is used to select between training and inference version of the network, because batch normalization behaves differently during training and inference.
+#
+# All parameter and activation shapes are the same as before, since batch normalization does not modify the shape of its input. Hence `fc1_input_count` and `fc1_output_count` computed above are valid.
+#
+# API reference for batch normalization is at https://www.tensorflow.org/api_docs/python/tf/layers/batch_normalization.
+
+# <codecell>
+
+def bn_model(X, y, is_training):
+    # Convolution layer.
+    conv1 = tf.layers.conv2d(inputs = X, filters = 32, kernel_size = [7, 7], strides = 2, padding = 'SAME', activation=tf.nn.relu, name = 'conv1')
+
+    # Batch normalization layer.
+    bn1 = tf.layers.batch_normalization(conv1, training = is_training)
+
+    # Pooling layer.
+    pool1 = tf.layers.max_pooling2d(inputs = bn1, pool_size = [2, 2], strides = 2, padding = 'SAME', name = 'pool1')
+
+    # First fully connected layer.
+    pool1_flat = tf.reshape(pool1,[-1, fc1_input_count])
+    fc1 = tf.layers.dense(inputs = pool1_flat, units = 1024, activation = tf.nn.relu, name = 'fc1')
+
+    # Second fully connected layer.
+    fc2 = tf.layers.dense(inputs = fc1, units = class_count, name = 'fc2')
+
+    return fc2
+
+# <markdowncell>
+
+# Input, metrics and optimizer are the same as before, so we can assemble the whole network.
+
+# <codecell>
+
+tf.reset_default_graph()
+writer = tf.summary.FileWriter(log_dir)
+X, y, is_training = setup_input()
+y_out = bn_model(X, y, is_training)
+mean_loss, accuracy, guess_prob, guess_class = setup_metrics(y, y_out)
+all_summaries = setup_scalar_summaries()
+train_step = setup_optimizer(mean_loss, 5e-4)
+
+# <markdowncell>
+
+# Now we are ready to train and validate the network with batch normalization as before.
+
+# <codecell>
+
+with tf.Session() as sess:
+    sess.run(tf.global_variables_initializer())
+    print('Training')
+    run_model(sess, y_out, mean_loss, X_train, y_train, 1, 64, 100, train_step)
+    print('Validation')
+    run_model(sess, y_out, mean_loss, X_val, y_val, 1, 64)
+
+# <markdowncell>
+
+# ## Exercise: build given architecture
+#
+# Your task is now to build the architecture contained in event file `cifar10_net_log\events.out.tfevents.1500743084.localhost`, and train it on CIFAR-10. You should train for 8 epochs with batch size 100 and learning rate 0.001.
+
+# <codecell>
+
+def cifar10_net(X, y, is_training):
+    # TODO
+    pass
+
+# <codecell>
+
+tf.reset_default_graph()
+writer = tf.summary.FileWriter(log_dir)
+X, y, is_training = setup_input()
+y_out = cifar10_net(X, y, is_training)
+mean_loss, accuracy, guess_prob, guess_class = setup_metrics(y, y_out)
+all_summaries = setup_scalar_summaries()
+train_step = setup_optimizer(mean_loss, 1e-3)
+
+# <codecell>
+
+writer.add_graph(tf.get_default_graph())
+
+# <codecell>
+
+with tf.Session() as sess:
+    sess.run(tf.global_variables_initializer())
+    print('Training')
+    run_model(sess, y_out, mean_loss, X_train, y_train, 8, 100, 100, train_step)
+    print('Validation')
+    run_model(sess, y_out, mean_loss, X_val, y_val, 1, 100)
+
+# <markdowncell>
+
+# ## Saving and loading models
+#
+# Saving is done using `tf.train.Saver` class:
+# * `save` method saves both network definition and weights. 
+# * `export_meta_graph` method saves only network definition.
+#
+# Loading is done in two stages:
+# * `tf.train.import_meta_graph` function loads network definition, and returns a saver object that was used to save the model.
+# * `restore` method of the returned saver object loads the weights.
+#
+# Note that since weights are available only inside a session, `save` and `restore` methods above require a session object as a parameter.
+#
+# Official TensorFlow documentation: [Saving and Restoring Variables](https://www.tensorflow.org/api_guides/python/state_ops#Saving_and_Restoring_Variables), [tf.train.Saver class](https://www.tensorflow.org/api_docs/python/tf/train/Saver), [tf.train.import_meta_graph function](https://www.tensorflow.org/api_docs/python/tf/train/import_meta_graph).
+#
+# Useful unofficial tutorial on saving and loading: http://cv-tricks.com/tensorflow-tutorial/save-restore-tensorflow-models-quick-complete-tutorial/
+
+# <markdowncell>
+
+# ## Transfer learning
+#
+# In this section we will start from a model which is pretrained on ImageNet, and finetune it for our CIFAR-10 recognition task.
+#
+# Pretrained model is given by meta-graph file (containing network definition), and checkpoint file (containing weights).
+
+# <codecell>
+
+pretrained_meta_graph = r"inception_resnet_v2\inception_resnet_v2_2016_08_30.meta"
+pretrained_checkpoint = r"inception_resnet_v2\inception_resnet_v2_2016_08_30.ckpt"
+
+# <markdowncell>
+
+# For the CIFAR-10 classification task we need to perform these two modifications to the pretrained mode at the very minimum:
+# * Process CIFAR-10 images so that their size becomes what pretrained model expects
+# * Adapt the last fully connected layer (which does final classification) so that the number of output neurons is 10 (the number of classes in the CIFAR-10 classification task)
+#
+# ### Get names of relevant nodes
+#
+# Modifying input part of a pretrained network is somewhat cumbersome. It has to be done simultaneously with loading network definition, by passing to `tf.train.import_meta_graph` a mappping from input tensors of the pretrained network to new input tensors.
+#
+# First we load pretrained network definition only to get the names of input placeholder nodes that we want to replace. This step can be skipped if these names are already known.
+
+# <codecell>
+
+tf.reset_default_graph()
+writer = tf.summary.FileWriter(log_dir)
+_ = tf.train.import_meta_graph(pretrained_meta_graph)
+
+# <markdowncell>
+
+# We can get the nodes' names using TensorBoard.
+
+# <codecell>
+
+writer.add_graph(tf.get_default_graph())
+
+# <markdowncell>
+
+# Alternatively, we can do it programmatically.
+
+# <codecell>
+
+for op in tf.get_default_graph().get_operations():
+    if op.type == 'Placeholder':
+        print(op.outputs[0].name + '\t' + str(op.outputs[0].shape))
+
+# <markdowncell>
+
+# Get the name of the fully connected layer that does final classification.
+
+# <codecell>
+
+for op in tf.get_default_graph().get_operations():
+    if op.type == "MatMul":
+        print('Operation: ' + op.name)
+        print('Inputs: ')
+        for inp in op.inputs:
+            print(inp.name + '\t' + str(inp.shape))
+
+# <markdowncell>
+
+# ### Modify input and output
+
+# <markdowncell>
+
+# Next we clear the default graph, and start creating new one, with modified input subnetwork which, which upsamples input image to match the size expected by pretrained network.
+
+# <codecell>
+
+tf.reset_default_graph()
+writer = tf.summary.FileWriter(log_dir)
+X, y, is_training = setup_input()
+X_upsampled = tf.image.resize_images(X, [299, 299])
+
+# <markdowncell>
+
+# Finally, we reload pretrained network definition, replacing pretrained input placeholders with new tensors we just created.
+
+# <codecell>
+
+saver = tf.train.import_meta_graph(pretrained_meta_graph,
+    input_map = { 'Placeholder:0' : X_upsampled, 'Placeholder_2:0' : is_training })
+
+# <markdowncell>
+
+# Get a handle to the tensor containing classification features.
+
+# <codecell>
+
+feat = tf.get_default_graph().get_tensor_by_name("InceptionResnetV2/Logits/Dropout/cond/Merge:0")
+
+# <markdowncell>
+
+# Attach a new fully connected layer for modified task.
+
+# <codecell>
+
+class_count = 10
+fc1 = tf.layers.dense(feat, class_count)
+
+# <markdowncell>
+
+# ### Complete network definition
+# Add metrics and optimizer as before.
+
+# <codecell>
+
+mean_loss, accuracy, guess_prob, guess_class = setup_metrics(y, fc1)
+all_summaries = setup_scalar_summaries()
+train_step = setup_optimizer(mean_loss, 5e-4)
+
+# <markdowncell>
+
+# Once again write out the graph to make sure surgery succeeded.
+
+# <codecell>
+
+writer.add_graph(tf.get_default_graph())
+
+# <markdowncell>
+
+# ### Train and validate network (at your own risk!)
+
+# <markdowncell>
+
+# Only now we can restore weights from checkpoint, because weights exist only inside a session.
+
+# <codecell>
+
+with tf.Session() as sess:
+    saver.restore(sess, pretrained_checkpoint)
+    print('Training')
+    run_model(sess, y_out, mean_loss, X_train, y_train, 1, 64, 100, train_step)
+    print('Validation')
+    run_model(sess, y_out, mean_loss, X_val, y_val, 1, 64)
